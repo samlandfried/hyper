@@ -2435,6 +2435,80 @@ async fn h2_connect_zero_window_then_release() {
 }
 
 #[tokio::test]
+async fn h2_connect_shutdown_while_send_backpressured() {
+    let (listener, addr) = setup_tcp_listener();
+    let conn = connect_async(addr).await;
+
+    let mut builder = h2::client::Builder::new();
+    builder.initial_window_size(1024);
+    builder.initial_connection_window_size(1024);
+    let (h2, connection) = builder.handshake::<_, Bytes>(conn).await.unwrap();
+    tokio::spawn(async move {
+        let _ = connection.await;
+    });
+    let mut h2 = h2.ready().await.unwrap();
+
+    let (shutdown_tx, shutdown_rx) = oneshot::channel::<bool>();
+    let shutdown_tx = Arc::new(Mutex::new(Some(shutdown_tx)));
+
+    let client_handle = tokio::spawn(async move {
+        let request = Request::connect("localhost").body(()).unwrap();
+        let (response, _send_stream) = h2.send_request(request, false).unwrap();
+        let response = response.await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let mut body = response.into_body();
+        let bytes = body.data().await.unwrap().unwrap();
+        assert_eq!(bytes.len(), 1024);
+
+        // Do not release capacity. The server-side upgraded writer should
+        // still observe shutdown of its mpsc sender instead of waiting for
+        // more h2 send capacity.
+        let shutdown_completed = shutdown_rx.await.unwrap_or(false);
+        assert!(
+            shutdown_completed,
+            "upgraded shutdown should not wait for h2 capacity after the writer closes"
+        );
+    });
+
+    let svc = service_fn(move |req: Request<IncomingBody>| {
+        let on_upgrade = hyper::upgrade::on(req);
+        let shutdown_tx = shutdown_tx.clone();
+
+        tokio::spawn(async move {
+            let mut upgraded = TokioIo::new(on_upgrade.await.expect("on_upgrade"));
+            upgraded.write_all(&[b'x'; 1024]).await.unwrap();
+
+            // Regression trigger: shutdown closes the mpsc sender while the
+            // send task is already parked waiting for h2 capacity.
+            let shutdown_completed =
+                tokio::time::timeout(Duration::from_secs(1), upgraded.shutdown())
+                    .await
+                    .is_ok();
+
+            if let Some(tx) = shutdown_tx.lock().unwrap().take() {
+                let _ = tx.send(shutdown_completed);
+            }
+        });
+
+        future::ok::<_, hyper::Error>(
+            Response::builder()
+                .status(200)
+                .body(Empty::<Bytes>::new())
+                .unwrap(),
+        )
+    });
+
+    let (socket, _) = listener.accept().await.unwrap();
+    let socket = TokioIo::new(socket);
+    let _ = http2::Builder::new(TokioExecutor)
+        .serve_connection(socket, svc)
+        .await;
+
+    client_handle.await.unwrap();
+}
+
+#[tokio::test]
 async fn h2_connect_reset_during_backpressure() {
     let (listener, addr) = setup_tcp_listener();
     let conn = connect_async(addr).await;
@@ -2478,10 +2552,11 @@ async fn h2_connect_reset_during_backpressure() {
             upgraded.write_all(b"initial").await.unwrap();
 
             let large_data = vec![b'x'; 1024 * 1024];
-            let write_result = upgraded.write_all(&large_data).await;
+            let first_write = upgraded.write_all(&large_data).await;
+            let second_write = upgraded.write_all(&large_data).await;
 
             if let Some(tx) = write_err_tx.lock().unwrap().take() {
-                let _ = tx.send(write_result.is_err());
+                let _ = tx.send(first_write.is_err() || second_write.is_err());
             }
         });
 
